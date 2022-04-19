@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 
 	"github.com/lukeroth/gdal"
 	"github.com/schollz/progressbar/v3"
@@ -12,10 +13,13 @@ import (
 
 func main() {
 
+	cores := 4
+	flag.IntVar(&cores, "j", 4, "Parallel cores to use")
+
 	flag.Parse()
 	filename := flag.Arg(0)
 	if filename == "" {
-		fmt.Printf("Usage: %s [filename]\n", os.Args[0])
+		fmt.Printf("Usage: %s [-j cores] [filename]\n", os.Args[0])
 		return
 	}
 
@@ -85,16 +89,33 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to read data: %v", err)
 		}
-		for index := 0; index < width; index++ {
-			val := blockBuffer[index]
-			for year := minYear; year <= maxYear; year += 1 {
-				yearVal := 0
-				if (val >= minYear) && (val <= year) {
-					yearVal = 255
-				}
-				yearBuffers[year-minYear][index] = uint8(yearVal)
+
+		wg := new(sync.WaitGroup)
+		for core := 0; core < cores; core++ {
+			wg.Add(1)
+			bucketSize := width / cores
+			offset := core * bucketSize
+			// account for aliasing errors
+			slop := width - (bucketSize * (core + 1))
+			if slop < bucketSize {
+				bucketSize += slop
 			}
+			go func() {
+				for index := 0; index < bucketSize; index += 1 {
+					val := blockBuffer[offset+index]
+					for year := minYear; year <= maxYear; year += 1 {
+						yearVal := 0
+						if (val >= minYear) && (val <= year) {
+							yearVal = 255
+						}
+						yearBuffers[year-minYear][offset+index] = uint8(yearVal)
+					}
+				}
+
+				wg.Done()
+			}()
 		}
+		wg.Wait()
 
 		for year := minYear; year <= maxYear; year += 1 {
 			dataset := datasets[year-minYear]
