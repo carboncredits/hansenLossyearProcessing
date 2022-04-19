@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/lukeroth/gdal"
+	"github.com/schollz/progressbar/v3"
 )
 
 func main() {
@@ -79,6 +80,7 @@ func main() {
 	}
 
 	blockBuffer := make([]uint8, width*1)
+	bar := progressbar.Default(int64(height))
 	for line := 0; line < height; line += 1 {
 		err := raster.IO(gdal.Read, 0, line, width, 1, blockBuffer, width, 1, 0, 0)
 		if err != nil {
@@ -103,7 +105,7 @@ func main() {
 				log.Fatalf("Failed to write buffer for year 2%03d: %v", year, err)
 			}
 		}
-		fmt.Printf("%g%%\n", float64(line)/float64(width)*100)
+		bar.Add(1)
 	}
 
 	for year := minYear; year <= maxYear; year += 1 {
