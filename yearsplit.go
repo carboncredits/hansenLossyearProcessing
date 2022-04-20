@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"sync"
 
@@ -13,7 +14,7 @@ import (
 
 func main() {
 
-	cores := 4
+	var cores int
 	flag.IntVar(&cores, "j", 4, "Parallel cores to use")
 
 	flag.Parse()
@@ -23,7 +24,7 @@ func main() {
 		return
 	}
 
-	geotiffDriver, err := gdal.GetDriverByName("GTiff")
+	outputDriver, err := gdal.GetDriverByName("GTiff")
 	if err != nil {
 		log.Fatalf("Failed to load GeoTIFF driver: %v", err)
 	}
@@ -71,7 +72,7 @@ func main() {
 		if _, err := os.Stat(filename); err == nil {
 			log.Fatalf("Dataset %s already exists, aborting.", filename)
 		}
-		dataset := geotiffDriver.Create(filename, width, height, 1, gdal.Byte, nil)
+		dataset := outputDriver.Create(filename, width, height, 1, gdal.Byte, nil)
 		dataset.SetProjection(yearData.Projection())
 		dataset.SetGeoTransform(transform)
 		datasets[year-minYear] = dataset
@@ -128,7 +129,58 @@ func main() {
 		bar.Add(1)
 	}
 
+	tilesbar := progressbar.Default(int64(maxYear-minYear) + 1)
 	for year := minYear; year <= maxYear; year += 1 {
-		datasets[year-minYear].Close()
+		dataset := datasets[year-minYear]
+
+		filename := fmt.Sprintf("accumulative_lossyear_to_2%03d_%s_%s.%s", year, lat, long, "mbtiles")
+
+		tiles_dataset, err := gdal.Translate(filename, dataset, nil)
+		if err != nil {
+			log.Fatalf("Failed to translate dataset for 2%03d: %v", year, err)
+		}
+		dataset.Close()
+
+		// now we want to generate more levels. The following is based on the
+		// source code to gdaladdo:
+		// https://github.com/OSGeo/gdal/blob/master/apps/gdaladdo.cpp
+
+		overviewFactor := 1.0
+		overviewLevels := make([]int, 0)
+		minTileSize := 256
+
+		bands := tiles_dataset.RasterCount()
+		bandList := make([]int, bands)
+		for index := 0; index < bands; index += 1 {
+			bandList[index] = index
+		}
+
+		for (int(math.Ceil(float64(width)/overviewFactor)) > minTileSize) &&
+			(int(math.Ceil(float64(height)/overviewFactor)) > minTileSize) {
+			overviewFactor *= 2
+			overviewLevels = append(overviewLevels, int(overviewFactor))
+		}
+
+		if bands > 0 {
+			gdal.CPLSetConfigOption("USE_RRD", "YES")
+		}
+
+		if len(overviewLevels) > 0 {
+			err := tiles_dataset.BuildOverviews(
+				"nearest",
+				len(overviewLevels),
+				overviewLevels,
+				bands,
+				bandList,
+				gdal.DummyProgress,
+				nil)
+			if err != nil {
+				log.Fatalf("Failed to build overviews for 2%03d: %v", year, err)
+			}
+		}
+
+		tiles_dataset.Close()
+		tilesbar.Add(1)
 	}
+
 }
