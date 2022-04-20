@@ -67,7 +67,9 @@ func datasetToTiles(outputFilename string, dataset gdal.Dataset) error {
 func main() {
 
 	var cores int
+	var driver string
 	flag.IntVar(&cores, "j", 4, "Parallel cores to use")
+	flag.StringVar(&driver, "d", "MEM", "Intermidiary driver to use")
 
 	flag.Parse()
 	filename := flag.Arg(0)
@@ -76,8 +78,14 @@ func main() {
 		return
 	}
 
-	outputDriver, err := gdal.GetDriverByName("GTiff")
+	outputDriver, err := gdal.GetDriverByName(driver)
 	if err != nil {
+		count := gdal.GetDriverCount()
+		fmt.Printf("Drivers:\n")
+		for index := 0; index < count; index += 1 {
+			driver := gdal.GetDriver(index)
+			fmt.Printf("\t%s: %s\n", driver.ShortName(), driver.LongName())
+		}
 		log.Fatalf("Failed to load GeoTIFF driver: %v", err)
 	}
 
