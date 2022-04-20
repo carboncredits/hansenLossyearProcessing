@@ -136,7 +136,7 @@ func main() {
 	}
 
 	blockBuffer := make([]uint8, width*1)
-	bar := progressbar.Default(int64(height))
+	bar := progressbar.Default(int64(height), "Splitting by year")
 	for line := 0; line < height; line += 1 {
 		err := raster.IO(gdal.Read, 0, line, width, 1, blockBuffer, width, 1, 0, 0)
 		if err != nil {
@@ -181,7 +181,7 @@ func main() {
 		bar.Add(1)
 	}
 
-	tilesbar := progressbar.Default(int64(maxYear-minYear) + 1)
+	tilesbar := progressbar.Default(int64(maxYear-minYear)+1, "Building tiles")
 	sem := make(chan struct{}, cores)
 	wg := new(sync.WaitGroup)
 	for year := minYear; year <= maxYear; year += 1 {
