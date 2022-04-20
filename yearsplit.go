@@ -12,6 +12,58 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
+func datasetToTiles(outputFilename string, dataset gdal.Dataset) error {
+
+	tiles_dataset, err := gdal.Translate(outputFilename, dataset, nil)
+	if err != nil {
+		return fmt.Errorf("failed to translate dataset for %s: %w", outputFilename, err)
+	}
+
+	// now we want to generate more levels. The following is based on the
+	// source code to gdaladdo:
+	// https://github.com/OSGeo/gdal/blob/master/apps/gdaladdo.cpp
+
+	overviewFactor := 1.0
+	overviewLevels := make([]int, 0)
+	minTileSize := 256
+
+	bands := tiles_dataset.RasterCount()
+	bandList := make([]int, bands)
+	for index := 0; index < bands; index += 1 {
+		bandList[index] = index
+	}
+
+	width := tiles_dataset.RasterXSize()
+	height := tiles_dataset.RasterYSize()
+
+	for (int(math.Ceil(float64(width)/overviewFactor)) > minTileSize) &&
+		(int(math.Ceil(float64(height)/overviewFactor)) > minTileSize) {
+		overviewFactor *= 2
+		overviewLevels = append(overviewLevels, int(overviewFactor))
+	}
+
+	if bands > 0 {
+		gdal.CPLSetConfigOption("USE_RRD", "YES")
+	}
+
+	if len(overviewLevels) > 0 {
+		err := tiles_dataset.BuildOverviews(
+			"nearest",
+			len(overviewLevels),
+			overviewLevels,
+			bands,
+			bandList,
+			gdal.DummyProgress,
+			nil)
+		if err != nil {
+			return fmt.Errorf("failed to build overviews for %s: %w", outputFilename, err)
+		}
+	}
+	tiles_dataset.Close()
+
+	return nil
+}
+
 func main() {
 
 	var cores int
@@ -130,57 +182,26 @@ func main() {
 	}
 
 	tilesbar := progressbar.Default(int64(maxYear-minYear) + 1)
+	sem := make(chan struct{}, cores)
+	wg := new(sync.WaitGroup)
 	for year := minYear; year <= maxYear; year += 1 {
 		dataset := datasets[year-minYear]
-
 		filename := fmt.Sprintf("accumulative_lossyear_to_2%03d_%s_%s.%s", year, lat, long, "mbtiles")
+		wg.Add(1)
+		go func() {
+			sem <- struct{}{}
 
-		tiles_dataset, err := gdal.Translate(filename, dataset, nil)
-		if err != nil {
-			log.Fatalf("Failed to translate dataset for 2%03d: %v", year, err)
-		}
-		dataset.Close()
-
-		// now we want to generate more levels. The following is based on the
-		// source code to gdaladdo:
-		// https://github.com/OSGeo/gdal/blob/master/apps/gdaladdo.cpp
-
-		overviewFactor := 1.0
-		overviewLevels := make([]int, 0)
-		minTileSize := 256
-
-		bands := tiles_dataset.RasterCount()
-		bandList := make([]int, bands)
-		for index := 0; index < bands; index += 1 {
-			bandList[index] = index
-		}
-
-		for (int(math.Ceil(float64(width)/overviewFactor)) > minTileSize) &&
-			(int(math.Ceil(float64(height)/overviewFactor)) > minTileSize) {
-			overviewFactor *= 2
-			overviewLevels = append(overviewLevels, int(overviewFactor))
-		}
-
-		if bands > 0 {
-			gdal.CPLSetConfigOption("USE_RRD", "YES")
-		}
-
-		if len(overviewLevels) > 0 {
-			err := tiles_dataset.BuildOverviews(
-				"nearest",
-				len(overviewLevels),
-				overviewLevels,
-				bands,
-				bandList,
-				gdal.DummyProgress,
-				nil)
+			err := datasetToTiles(filename, dataset)
+			dataset.Close()
 			if err != nil {
-				log.Fatalf("Failed to build overviews for 2%03d: %v", year, err)
+				log.Fatalf("Failed to generate tiles: %v", err)
 			}
-		}
+			<-sem
 
-		tiles_dataset.Close()
-		tilesbar.Add(1)
+			tilesbar.Add(1)
+			wg.Done()
+		}()
 	}
+	wg.Wait()
 
 }
