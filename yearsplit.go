@@ -14,7 +14,8 @@ import (
 
 func datasetToTiles(outputFilename string, dataset gdal.Dataset) error {
 
-	tiles_dataset, err := gdal.Translate(outputFilename, dataset, nil)
+	options := []string{"-of", "mbtiles"}
+	tiles_dataset, err := gdal.Translate(outputFilename, dataset, options)
 	if err != nil {
 		return fmt.Errorf("failed to translate dataset for %s: %w", outputFilename, err)
 	}
@@ -46,6 +47,7 @@ func datasetToTiles(outputFilename string, dataset gdal.Dataset) error {
 		gdal.CPLSetConfigOption("USE_RRD", "YES")
 	}
 
+	fmt.Printf("Generating %d levels: %v\n", len(overviewLevels), overviewLevels)
 	if len(overviewLevels) > 0 {
 		err := tiles_dataset.BuildOverviews(
 			"nearest",
@@ -67,9 +69,7 @@ func datasetToTiles(outputFilename string, dataset gdal.Dataset) error {
 func main() {
 
 	var cores int
-	var driver string
 	flag.IntVar(&cores, "j", 4, "Parallel cores to use")
-	flag.StringVar(&driver, "d", "MEM", "Intermidiary driver to use")
 
 	flag.Parse()
 	filename := flag.Arg(0)
@@ -78,7 +78,7 @@ func main() {
 		return
 	}
 
-	outputDriver, err := gdal.GetDriverByName(driver)
+	outputDriver, err := gdal.GetDriverByName("MEM")
 	if err != nil {
 		count := gdal.GetDriverCount()
 		fmt.Printf("Drivers:\n")
@@ -117,8 +117,14 @@ func main() {
 	// so I'm using that as my chunk size to make it easier to migrate to ReadBlock
 	// later if I need the performance.
 
-	minYear := uint8(1)
-	maxYear := uint8(20)
+	// Given infinite memory we'd just process the data once, but
+	// GDAL seems to hold the entire dataset in memory, and so with Hansen tiles
+	// clocking in at 1.6GB uncomporessed we run out of memory on "normal"
+	// machines quite quickly. So instead we process years in batches.
+
+	totalMinYear := uint8(1)
+	totalMaxYear := uint8(20)
+	yearBatchSize := cores
 
 	// we want to name the files similar to what Hansen does, so
 	// we'll use this data to derive the filename
@@ -126,90 +132,99 @@ func main() {
 	long := fmt.Sprintf("%d", (int(transform[0])+360)%360)
 	lat := fmt.Sprintf("%d", (int(transform[3])+360)%360)
 
-	datasets := make([]gdal.Dataset, (maxYear-minYear)+1)
-	for year := minYear; year <= maxYear; year += 1 {
-		filename := fmt.Sprintf("accumulative_lossyear_to_2%03d_%s_%s.tiff", year, lat, long)
-		if _, err := os.Stat(filename); err == nil {
-			log.Fatalf("Dataset %s already exists, aborting.", filename)
+	for minYear := totalMinYear; minYear < totalMaxYear; minYear += uint8(yearBatchSize) {
+		maxYear := minYear + uint8(yearBatchSize) - 1
+		if maxYear > totalMaxYear {
+			maxYear = totalMaxYear
 		}
-		dataset := outputDriver.Create(filename, width, height, 1, gdal.Byte, nil)
-		dataset.SetProjection(yearData.Projection())
-		dataset.SetGeoTransform(transform)
-		datasets[year-minYear] = dataset
-	}
+		fmt.Printf("Processing 2%03d to 2%03d...\n", minYear, maxYear)
 
-	yearBuffers := make([][]uint8, (maxYear-minYear)+1)
-	for year := minYear; year <= maxYear; year += 1 {
-		yearBuffers[year-minYear] = make([]uint8, width)
-	}
-
-	blockBuffer := make([]uint8, width*1)
-	bar := progressbar.Default(int64(height), "Splitting by year")
-	for line := 0; line < height; line += 1 {
-		err := raster.IO(gdal.Read, 0, line, width, 1, blockBuffer, width, 1, 0, 0)
-		if err != nil {
-			log.Fatalf("Failed to read data: %v", err)
-		}
-
-		wg := new(sync.WaitGroup)
-		for core := 0; core < cores; core++ {
-			wg.Add(1)
-			bucketSize := width / cores
-			offset := core * bucketSize
-			// account for aliasing errors
-			slop := width - (bucketSize * (core + 1))
-			if slop < bucketSize {
-				bucketSize += slop
+		datasets := make([]gdal.Dataset, (maxYear-minYear)+1)
+		for year := minYear; year <= maxYear; year += 1 {
+			filename := fmt.Sprintf("accumulative_lossyear_to_2%03d_%s_%s.tiff", year, lat, long)
+			if _, err := os.Stat(filename); err == nil {
+				log.Fatalf("Dataset %s already exists, aborting.", filename)
 			}
-			go func() {
-				for index := 0; index < bucketSize; index += 1 {
-					val := blockBuffer[offset+index]
-					for year := minYear; year <= maxYear; year += 1 {
-						yearVal := 0
-						if (val >= minYear) && (val <= year) {
-							yearVal = 255
-						}
-						yearBuffers[year-minYear][offset+index] = uint8(yearVal)
-					}
+			dataset := outputDriver.Create(filename, width, height, 1, gdal.Byte, nil)
+			dataset.SetProjection(yearData.Projection())
+			dataset.SetGeoTransform(transform)
+			datasets[year-minYear] = dataset
+		}
+
+		yearBuffers := make([][]uint8, (maxYear-minYear)+1)
+		for year := minYear; year <= maxYear; year += 1 {
+			yearBuffers[year-minYear] = make([]uint8, width)
+		}
+
+		blockBuffer := make([]uint8, width*1)
+		bar := progressbar.Default(int64(height), "Splitting by year")
+		bar.RenderBlank()
+		for line := 0; line < height; line += 1 {
+			err := raster.IO(gdal.Read, 0, line, width, 1, blockBuffer, width, 1, 0, 0)
+			if err != nil {
+				log.Fatalf("Failed to read data: %v", err)
+			}
+
+			wg := new(sync.WaitGroup)
+			for core := 0; core < cores; core++ {
+				wg.Add(1)
+				bucketSize := width / cores
+				offset := core * bucketSize
+				// account for aliasing errors
+				slop := width - (bucketSize * (core + 1))
+				if slop < bucketSize {
+					bucketSize += slop
 				}
+				go func() {
+					for index := 0; index < bucketSize; index += 1 {
+						val := blockBuffer[offset+index]
+						for year := minYear; year <= maxYear; year += 1 {
+							yearVal := 0
+							if (val >= minYear) && (val <= year) {
+								yearVal = 255
+							}
+							yearBuffers[year-minYear][offset+index] = uint8(yearVal)
+						}
+					}
+
+					wg.Done()
+				}()
+			}
+			wg.Wait()
+
+			for year := minYear; year <= maxYear; year += 1 {
+				dataset := datasets[year-minYear]
+				raster := dataset.RasterBand(1)
+				err := raster.IO(gdal.Write, 0, line, width, 1, yearBuffers[year-minYear], width, 1, 0, 0)
+				if err != nil {
+					log.Fatalf("Failed to write buffer for year 2%03d: %v", year, err)
+				}
+			}
+			bar.Add(1)
+		}
+		fmt.Printf("data processed...\n")
+
+		tilesbar := progressbar.Default((int64(maxYear-minYear)+1)*100, "Building tiles")
+		tilesbar.RenderBlank()
+		sem := make(chan struct{}, cores)
+		wg := new(sync.WaitGroup)
+		for year := minYear; year <= maxYear; year += 1 {
+			dataset := datasets[year-minYear]
+			filename := fmt.Sprintf("accumulative_lossyear_to_2%03d_%s_%s.%s", year, lat, long, "mbtiles")
+			wg.Add(1)
+			go func() {
+				sem <- struct{}{}
+
+				err := datasetToTiles(filename, dataset)
+				dataset.Close()
+				if err != nil {
+					log.Fatalf("Failed to generate tiles: %v", err)
+				}
+				<-sem
 
 				wg.Done()
 			}()
 		}
 		wg.Wait()
-
-		for year := minYear; year <= maxYear; year += 1 {
-			dataset := datasets[year-minYear]
-			raster := dataset.RasterBand(1)
-			err := raster.IO(gdal.Write, 0, line, width, 1, yearBuffers[year-minYear], width, 1, 0, 0)
-			if err != nil {
-				log.Fatalf("Failed to write buffer for year 2%03d: %v", year, err)
-			}
-		}
-		bar.Add(1)
 	}
-
-	tilesbar := progressbar.Default(int64(maxYear-minYear)+1, "Building tiles")
-	sem := make(chan struct{}, cores)
-	wg := new(sync.WaitGroup)
-	for year := minYear; year <= maxYear; year += 1 {
-		dataset := datasets[year-minYear]
-		filename := fmt.Sprintf("accumulative_lossyear_to_2%03d_%s_%s.%s", year, lat, long, "mbtiles")
-		wg.Add(1)
-		go func() {
-			sem <- struct{}{}
-
-			err := datasetToTiles(filename, dataset)
-			dataset.Close()
-			if err != nil {
-				log.Fatalf("Failed to generate tiles: %v", err)
-			}
-			<-sem
-
-			tilesbar.Add(1)
-			wg.Done()
-		}()
-	}
-	wg.Wait()
-
 }
